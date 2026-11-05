@@ -91,13 +91,13 @@ def construct_conv2d_toeplitz(conv_layer, weight):
     for i, start_idx in enumerate(corner_indices):
         rows = (row_map[i] + out_channels).reshape(-1, 1)
         cols = initial_kernel_position + start_idx
-        toeplitz[rows, cols] = kernel_flat
+        toeplitz[rows.numpy(), cols.numpy()] = kernel_flat.numpy()
 
     # Keep only the columns corresponding to the non-padded input image.
     row_idxs = torch.arange(P*iG, P*iG + on_Hi).reshape(-1, 1)
     col_idxs = torch.arange(P*iG, P*iG + on_Wi)
     image_indices = valid_image_indices[:, row_idxs, col_idxs].flatten()
-    toeplitz = toeplitz.tocsc()[:, image_indices]
+    toeplitz = toeplitz.tocsc()[:, image_indices.numpy()]
     
     # Support batching
     toeplitz = sp.kron(sp.eye(N, dtype="f"), toeplitz, format="csr")
