@@ -104,9 +104,15 @@ struct PolyEntry { std::vector<double> coeffs; bool chebyshev = false; };
 struct Scheme {
     CryptoContext<DCRTPoly> cc;
     KeyPair<DCRTPoly> kp;
-    uint32_t depth = 0;      // max level (Lattigo convention)
+    uint32_t depth = 0;      // total depth of the modulus chain (Lattigo level convention: level = towers-1)
+    uint32_t userDepth = 0;  // max level visible to Orion (= len(LogQ)-1); the rest is bootstrapping headroom
+    bool bootEnabled = false;
+    int off = 0;             // Orion level l <-> internal level l+off (one hidden bottom limb when bootstrapping)
+    std::vector<uint32_t> levelBudget{3, 3};
+    std::set<int> bootSlots;
     uint32_t slots = 0;
-    uint32_t scaleBits = 0;  // p, plaintext scaling exponent
+    uint32_t scaleBits = 0;  // p, plaintext scaling exponent (internal scale 2^p)
+    double pyDefaultScale = 0;  // Orion's default scale 2^LogScale, mapped to 2^p when they differ
     std::vector<uint64_t> Q, P;
     std::set<int> rotKeys;   // rotation amounts with generated keys
     bool relinGenerated = false;
@@ -114,16 +120,27 @@ struct Scheme {
     void reset() {
         cc = nullptr;
         kp = KeyPair<DCRTPoly>();
-        depth = slots = scaleBits = 0;
+        depth = userDepth = slots = scaleBits = 0;
+        pyDefaultScale = 0;
+        off = 0;
+        bootSlots.clear();
         Q.clear(); P.clear(); rotKeys.clear();
         relinGenerated = false;
     }
 } S;
 
+struct BootConfig { bool enabled = false; uint32_t enc = 3, dec = 3; } g_boot;
+
 Table<PtEntry> pts;
 Table<CT> cts;
 Table<LinTransform> lts;
 Table<PolyEntry> polys;
+
+// Orion passes its default scale 2^LogScale to mean "the default scale"; map it to the internal one.
+double map_scale(unsigned long scale) {
+    double s = static_cast<double>(scale);
+    return (S.pyDefaultScale != 0 && s == S.pyDefaultScale) ? std::pow(2.0, S.scaleBits) : s;
+}
 
 int normRot(int r) {
     int n = static_cast<int>(S.slots);
@@ -237,6 +254,152 @@ CT rotate(const CT& ct, int amount) {
     return S.cc->EvalRotate(ct, r);
 }
 
+// ---- ciphertext helpers used by polynomial evaluation and bootstrapping ----------------
+
+CT rescale_ct(const CT& ct) {
+    int lvl = level_of(ct);
+    if (lvl < 1) throw std::runtime_error("rescale: no level left");
+    double s = scale_of(ct) / static_cast<double>(S.Q[lvl]);
+    CT out = S.cc->ModReduce(ct);
+    out->SetScalingFactor(s);
+    return out;
+}
+
+CT align_level(const CT& ct, int level) {
+    int diff = level_of(ct) - level;
+    if (diff < 0) throw std::runtime_error("cannot raise ciphertext level");
+    return diff == 0 ? ct : S.cc->LevelReduce(ct, nullptr, diff);
+}
+
+// ct * c where the constant is encoded at scale targetScale/scale(ct), so that the product has
+// exactly the scale targetScale (the multiplication is not rescaled).
+CT mul_const_scale(const CT& ct, double c, double targetScale) {
+    double constScale = targetScale / scale_of(ct);
+    CT out = S.cc->EvalMult(ct, c * constScale / std::pow(2.0, S.scaleBits));
+    out->SetScalingFactor(targetScale);
+    return out;
+}
+
+// ct + c, with c encoded at the exact scale of ct.
+CT add_const_exact(const CT& ct, double c) {
+    CT out = ct->Clone();
+    auto& cv = out->GetElements();
+    const uint32_t N = cv[0].GetLength();
+    long double v = std::fabs(static_cast<long double>(c)) * static_cast<long double>(scale_of(ct));
+    unsigned __int128 mag = static_cast<unsigned __int128>(v + 0.5L);
+    DCRTPoly elems(cv[0].GetParams(), Format::COEFFICIENT, true);
+    const uint32_t towers = elems.GetNumOfElements();
+    for (uint32_t i = 0; i < towers; i++) {
+        auto element = cv[0].GetElementAtIndex(i);
+        auto modulus = element.GetModulus();
+        NativeVector vec(N, modulus);
+        uint64_t q = modulus.ConvertToInt();
+        uint64_t r = static_cast<uint64_t>(mag % static_cast<unsigned __int128>(q));
+        if (c < 0 && r != 0) r = q - r;
+        vec[0] = NativeInteger(r);
+        element.SetValues(std::move(vec), Format::COEFFICIENT);
+        elems.SetElementAtIndex(i, std::move(element));
+    }
+    elems.SetFormat(Format::EVALUATION);
+    cv[0] += elems;
+    return out;
+}
+
+int ceil_log2(int d) { int m = 0; while ((1 << m) < d) m++; return m; }
+
+// Depth-optimal polynomial evaluation (Paterson-Stockmeyer style, as in Lattigo): intermediate
+// results stay "unrescaled" (scale ~ 2^(2p)); a node of the recursion is evaluated as
+//     rescale(q) * T_k + r
+// at the level where T_k lives, so that the whole polynomial of degree d consumes exactly
+// bits(d) = ceil(log2(d+1)) levels, with every constant encoded at ~2^p precision.
+CT evaluate_polynomial(const CT& x, const PolyEntry& poly, double outScale) {
+    std::vector<double> coeffs = poly.coeffs;
+    while (coeffs.size() > 1 && coeffs.back() == 0.0) coeffs.pop_back();
+    const int d = static_cast<int>(coeffs.size()) - 1;
+    const int L = level_of(x);
+    const int D = d == 0 ? 1 : 64 - __builtin_clzll(static_cast<unsigned long long>(d));
+    if (D > L) throw std::runtime_error("polynomial of degree " + std::to_string(d) + " needs " + std::to_string(D) +
+                                        " levels but the input has level " + std::to_string(L));
+    const bool cheb = poly.chebyshev;
+    constexpr int LEAF_MAX = 16;
+
+    std::map<int, CT> T;
+    T[1] = x;
+    std::function<const CT&(int)> power = [&](int i) -> const CT& {
+        auto it = T.find(i);
+        if (it != T.end()) return it->second;
+        int a = (i + 1) / 2, b = i / 2;
+        CT Ta = power(a), Tb = power(b);
+        int lvl = std::min(level_of(Ta), level_of(Tb));
+        CT A = align_level(Ta, lvl), B = align_level(Tb, lvl);
+        CT prod = S.cc->EvalMult(A, B);
+        double sp = scale_of(A) * scale_of(B);
+        prod->SetScalingFactor(sp);
+        if (cheb) {  // T_{a+b} = 2 T_a T_b - T_{|a-b|}
+            prod = S.cc->EvalAdd(prod, prod);
+            prod->SetScalingFactor(sp);
+            if (a == b) {
+                prod = add_const_exact(prod, -1.0);
+            } else {
+                CT sub = mul_const_scale(align_level(power(a - b), lvl), 1.0, sp);
+                prod = S.cc->EvalSub(prod, sub);
+                prod->SetScalingFactor(sp);
+            }
+        }
+        return T[i] = rescale_ct(prod);
+    };
+
+    auto leaf = [&](const std::vector<double>& cf, int lvl, double sc) -> CT {
+        CT res;
+        for (size_t i = 1; i < cf.size(); i++) {
+            if (cf[i] == 0.0) continue;
+            CT t = mul_const_scale(align_level(power(static_cast<int>(i)), lvl), cf[i], sc);
+            if (res) { res = S.cc->EvalAdd(res, t); res->SetScalingFactor(sc); } else res = std::move(t);
+        }
+        if (!res) res = mul_const_scale(align_level(power(1), lvl), 0.0, sc);
+        if (cf[0] != 0.0) res = add_const_exact(res, cf[0]);
+        return res;
+    };
+
+    std::function<CT(std::vector<double>, int, double)> node = [&](std::vector<double> cf, int lvl, double sc) -> CT {
+        while (cf.size() > 1 && cf.back() == 0.0) cf.pop_back();
+        const int dd = static_cast<int>(cf.size()) - 1;
+        const int m = dd >= 2 ? ceil_log2(dd) : 0;
+        const bool leafFeasible = lvl <= L - m;
+        if (dd <= 1 || (leafFeasible && dd <= LEAF_MAX)) return leaf(cf, lvl, sc);
+        if (lvl + 1 > L) throw std::runtime_error("polynomial evaluation: not enough levels");
+        int k = 1;
+        while (2 * k < dd) k *= 2;  // largest power of two below the degree
+        std::vector<double> q(dd - k + 1, 0.0), r;
+        std::vector<double> work = cf;
+        if (cheb) {
+            for (int i = dd; i > k; i--) {
+                q[i - k] += 2.0 * work[i];
+                work[std::abs(2 * k - i)] -= work[i];
+                work[i] = 0.0;
+            }
+            q[0] += work[k];
+        } else {
+            for (int i = dd; i >= k; i--) q[i - k] = work[i];
+        }
+        r.assign(work.begin(), work.begin() + k);
+        const CT& X = power(k);
+        double sx = scale_of(X);
+        double sb = sc * static_cast<double>(S.Q[lvl + 1]) / sx;
+        CT b = rescale_ct(node(q, lvl + 1, sb));
+        CT prod = S.cc->EvalMult(b, align_level(X, lvl));
+        prod->SetScalingFactor(scale_of(b) * sx);
+        CT a = node(r, lvl, sc);
+        CT out = S.cc->EvalAdd(prod, a);
+        out->SetScalingFactor(sc);
+        return out;
+    };
+
+    const int rootLevel = L - D + 1;
+    CT root = node(coeffs, rootLevel, outScale * static_cast<double>(S.Q[rootLevel]));
+    return rescale_ct(root);
+}
+
 }  // namespace
 
 extern "C" {
@@ -247,33 +410,60 @@ void NewScheme(int logN, int* logQ, int lenQ, int* logP, int lenP, int logScale,
     (void)h; (void)keysPath; (void)ioMode;
     API_BEGIN
     if (lenQ < 1) throw std::runtime_error("LogQ must not be empty");
-    for (int i = 1; i < lenQ; i++)
-        if (logQ[i] != logScale)
-            throw std::runtime_error("OpenFHE backend (FIXEDMANUAL) requires every LogQ entry after the first "
-                                     "to equal LogScale");
+    if (!g_boot.enabled)
+        for (int i = 1; i < lenQ; i++)
+            if (logQ[i] != logScale)
+                throw std::runtime_error("OpenFHE backend (FIXEDMANUAL) requires every LogQ entry after the first "
+                                         "to equal LogScale");
     bool ci = std::string(ringType) != "standard";
     uint32_t ringDim = 1u << (logN + (ci ? 1 : 0));
+
+    uint32_t bootDepth = 0;
+    std::vector<uint32_t> levelBudget{g_boot.enc, g_boot.dec};
+    if (g_boot.enabled) bootDepth = FHECKKSRNS::GetBootstrapDepth(levelBudget, SPARSE_TERNARY);
 
     CCParams<CryptoContextCKKSRNS> p;
     p.SetSecurityLevel(HEStd_NotSet);
     p.SetRingDim(ringDim);
     p.SetBatchSize(ringDim / 2);
-    p.SetMultiplicativeDepth(lenQ - 1);
-    p.SetScalingModSize(logScale);
-    p.SetFirstModSize(logQ[0]);
+    const int off = g_boot.enabled ? 1 : 0;
+    p.SetMultiplicativeDepth(lenQ - 1 + off + bootDepth);
+    // OpenFHE's bootstrapping is only accurate with a scale of about 2^52 or more and a 60-bit q0
+    // (it fails outright at 2^40). When bootstrapping is enabled the backend therefore uses its own
+    // internal scale and maps Orion's default scale onto it.
+    int scaleBits = logScale;
+    if (g_boot.enabled) {
+        const char* e = std::getenv("ORION_OPENFHE_BOOT_SCALE");
+        scaleBits = std::max(logScale, e ? std::atoi(e) : 53);
+    }
+    p.SetScalingModSize(scaleBits);
+    // OpenFHE's fixed-scaling bootstrapping requires q0 within a few bits of the scale.
+    uint32_t firstMod = logQ[0];
+    if (g_boot.enabled) {
+        const char* e = std::getenv("ORION_OPENFHE_BOOT_Q0");
+        firstMod = std::max<uint32_t>(firstMod, e ? static_cast<uint32_t>(std::atoi(e)) : 60);
+    }
+    p.SetFirstModSize(firstMod);
     p.SetScalingTechnique(FIXEDMANUAL);
     p.SetKeySwitchTechnique(HYBRID);
-    p.SetSecretKeyDist(UNIFORM_TERNARY);
-    if (lenP > 0) p.SetNumLargeDigits((lenQ + lenP - 1) / lenP);
+    p.SetSecretKeyDist(g_boot.enabled ? SPARSE_TERNARY : UNIFORM_TERNARY);
+    if (lenP > 0 && !g_boot.enabled) p.SetNumLargeDigits((lenQ + lenP - 1) / lenP);
 
     S.reset();
     S.cc = GenCryptoContext(p);
     S.cc->Enable(PKE);
     S.cc->Enable(KEYSWITCH);
     S.cc->Enable(LEVELEDSHE);
-    S.depth = lenQ - 1;
+    S.cc->Enable(ADVANCEDSHE);
+    if (g_boot.enabled) S.cc->Enable(FHE);
+    S.bootEnabled = g_boot.enabled;
+    S.levelBudget = levelBudget;
+    S.off = off;
+    S.userDepth = lenQ - 1 + off;  // max internal level visible to Orion
+    S.depth = lenQ - 1 + off + bootDepth;
     S.slots = ringDim / 2;
-    S.scaleBits = logScale;
+    S.scaleBits = scaleBits;
+    S.pyDefaultScale = std::pow(2.0, logScale);
 
     auto cp = S.cc->GetCryptoParameters();
     for (auto& t : cp->GetElementParams()->GetParams()) S.Q.push_back(t->GetModulus().ConvertToInt());
@@ -302,12 +492,15 @@ unsigned long GetPlaintextScale(int id) { return static_cast<unsigned long>(std:
 unsigned long GetCiphertextScale(int id) { return static_cast<unsigned long>(std::llround(scale_of(cts.get(id)))); }
 void SetPlaintextScale(int id, unsigned long s) { pts.get(id).scale = static_cast<double>(s); }
 void SetCiphertextScale(int id, unsigned long s) { cts.get(id)->SetScalingFactor(static_cast<double>(s)); }
-int GetPlaintextLevel(int id) { return level_of(pts.get(id).pt); }
-int GetCiphertextLevel(int id) { return level_of(cts.get(id)); }
+int GetPlaintextLevel(int id) { return level_of(pts.get(id).pt) - S.off; }
+int GetCiphertextLevel(int id) { return level_of(cts.get(id)) - S.off; }
 int GetPlaintextSlots(int) { return static_cast<int>(S.slots); }
 int GetCiphertextSlots(int) { return static_cast<int>(S.slots); }
 int GetCiphertextDegree(int id) { return static_cast<int>(cts.get(id)->NumberCiphertextElements()) - 1; }
-ArrayResultUInt64 GetModuliChain(void) { return u64_array(S.Q); }
+ArrayResultUInt64 GetModuliChain(void) {
+    // Orion's Q[l] is the prime dropped when rescaling at its level l (internal level l+off).
+    return u64_array(std::vector<uint64_t>(S.Q.begin() + S.off, S.Q.end()));
+}
 ArrayResultUInt64 GetAuxModuliChain(void) { return u64_array(S.P); }
 ArrayResultInt GetLivePlaintexts(void) { return int_array(pts.keys()); }
 ArrayResultInt GetLiveCiphertexts(void) { return int_array(cts.keys()); }
@@ -338,9 +531,9 @@ int Encode(float* values, int len, int level, unsigned long scale) {
     std::vector<std::complex<double>> v(len);
     for (int i = 0; i < len; i++) v[i] = values[i];
     PtEntry e;
-    e.pt = encode(v, true, level, static_cast<double>(scale));
+    e.scale = map_scale(scale);
+    e.pt = encode(v, true, level + S.off, e.scale);
     e.vals = v; e.real = true;
-    e.scale = static_cast<double>(scale);
     return pts.add(std::move(e));
     API_END("Encode")
 }
@@ -360,9 +553,9 @@ int EncodeComplex(float* interleaved, int len, int level, unsigned long scale) {
     std::vector<std::complex<double>> v(len / 2);
     for (int i = 0; i < len / 2; i++) v[i] = {interleaved[2 * i], interleaved[2 * i + 1]};
     PtEntry e;
-    e.pt = encode(v, false, level, static_cast<double>(scale));
+    e.scale = map_scale(scale);
+    e.pt = encode(v, false, level + S.off, e.scale);
     e.vals = v; e.real = false;
-    e.scale = static_cast<double>(scale);
     return pts.add(std::move(e));
     API_END("EncodeComplex")
 }
@@ -412,7 +605,10 @@ int Decrypt(int id) {
 // ---------------------------------------------------------------- evaluator --
 void NewEvaluator(void) {
     API_BEGIN
-    for (uint32_t i = 1; i < S.slots; i *= 2) ensure_rot_key(static_cast<int>(i));
+    // Eagerly generate the power-of-two rotation keys for small rings; for big rings they
+    // are generated on first use (keys span the whole modulus chain and are large).
+    if (S.slots <= 8192)
+        for (uint32_t i = 1; i < S.slots; i *= 2) ensure_rot_key(static_cast<int>(i));
     API_END("NewEvaluator")
 }
 void AddRotationKey(int rotation) {
@@ -479,9 +675,12 @@ int MulScalarFloat(int id, float s) { API_BEGIN return scalar_mul_float(id, s, t
 int MulScalarFloatNew(int id, float s) { API_BEGIN return scalar_mul_float(id, s, false); API_END("MulScalarFloatNew") }
 
 static int pt_op(int cid, int pid, bool inPlace, int kind) {  // 0 add, 1 sub, 2 mul
-    return unary(cid, inPlace, [&](const CT& ct) {
+    return unary(cid, inPlace, [&](const CT& ct0) {
         auto& e = pts.get(pid);
-        Plaintext pt = pt_at_level(e, level_of(ct));
+        // Like Lattigo, operate at the lower of the two levels.
+        int lvl = std::min(level_of(ct0), level_of(e.pt));
+        CT ct = align_level(ct0, lvl);
+        Plaintext pt = pt_at_level(e, lvl);
         if (kind == 0) return Res{S.cc->EvalAdd(ct, pt), scale_of(ct)};
         if (kind == 1) return Res{S.cc->EvalSub(ct, pt), scale_of(ct)};
         return Res{S.cc->EvalMult(ct, pt), scale_of(ct) * e.scale};
@@ -524,7 +723,13 @@ int GenerateChebyshev(float* coeffs, int len) {
     return polys.add(std::move(p));
     API_END("GenerateChebyshev")
 }
-int EvaluatePolynomial(int, int, unsigned long) { unsupported("EvaluatePolynomial"); }
+int EvaluatePolynomial(int ctId, int polyId, unsigned long outScale) {
+    API_BEGIN PROF("EvaluatePolynomial");
+    double sc = outScale ? map_scale(outScale) : std::pow(2.0, S.scaleBits);
+    CT out = evaluate_polynomial(cts.get(ctId), polys.get(polyId), sc);
+    return push_ct(out, scale_of(out));
+    API_END("EvaluatePolynomial")
+}
 ArrayResultDouble GenerateMinimaxSignCoeffs(int*, int, int, int, int, int) { unsupported("GenerateMinimaxSignCoeffs"); }
 
 // ---------------------------------------------------------- linear transforms --
@@ -540,6 +745,7 @@ int GenerateLinearTransform(int* diagIdxs, int lenIdxs, float* diagData, int len
     API_BEGIN
     if (std::string(ioMode) != "none") unsupported("GenerateLinearTransform (io_mode save/load)");
     (void)bsgsRatio;
+    level += S.off;  // Orion level -> internal level
     const int n = static_cast<int>(S.slots);
     if (lenData != lenIdxs * n) throw std::runtime_error("linear transform: unexpected diagonal data length");
     if (level < 1 || level > static_cast<int>(S.depth)) throw std::runtime_error("linear transform: invalid level");
@@ -622,10 +828,10 @@ int GenerateLinearTransform(int* diagIdxs, int lenIdxs, float* diagData, int len
 int EvaluateLinearTransform(int tid, int cid) {
     API_BEGIN PROF("EvaluateLinearTransform");
     auto& lt = lts.get(tid);
-    const CT& ct = cts.get(cid);
-    if (level_of(ct) != lt.level)
-        throw std::runtime_error("linear transform: input level " + std::to_string(level_of(ct)) +
-                                 " != transform level " + std::to_string(lt.level));
+    if (level_of(cts.get(cid)) < lt.level)
+        throw std::runtime_error("linear transform: input level " + std::to_string(level_of(cts.get(cid))) +
+                                 " < transform level " + std::to_string(lt.level));
+    const CT ct = align_level(cts.get(cid), lt.level);  // a higher-level input is dropped to the transform's level
     using clk = std::chrono::steady_clock;
     static const bool prof = std::getenv("ORION_OPENFHE_PROFILE") != nullptr;
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
@@ -720,8 +926,51 @@ void RemovePlaintextDiagonals(int) { unsupported("RemovePlaintextDiagonals"); }
 void RemoveRotationKeys(void) { unsupported("RemoveRotationKeys"); }
 
 // ------------------------------------------------------------- bootstrapping --
-void NewBootstrapper(int*, int, int) { unsupported("NewBootstrapper"); }
-int Bootstrap(int, int) { unsupported("Bootstrap"); }
+// Backend-specific extension (not exported by the Lattigo library): must be called before
+// NewScheme to reserve bootstrapping levels at the top of the modulus chain.
+void OrionOpenFHEConfigureBootstrapping(int enable, int levelBudgetEnc, int levelBudgetDec) {
+    g_boot.enabled = enable != 0;
+    g_boot.enc = levelBudgetEnc > 0 ? levelBudgetEnc : 3;
+    g_boot.dec = levelBudgetDec > 0 ? levelBudgetDec : 3;
+}
+
+void NewBootstrapper(int*, int, int numSlots) {
+    API_BEGIN PROF("NewBootstrapper");
+    if (!S.bootEnabled) throw std::runtime_error("bootstrapping was not enabled before NewScheme");
+    if (S.bootSlots.count(numSlots)) return;
+    // The first modulus is larger than the scale; OpenFHE's correction factor must cover the difference.
+    S.cc->EvalBootstrapSetup(S.levelBudget, {0, 0}, numSlots);
+    S.cc->EvalBootstrapKeyGen(S.kp.secretKey, numSlots);
+    S.bootSlots.insert(numSlots);
+    API_END("NewBootstrapper")
+}
+
+// Same semantics as the Lattigo backend: the input holds `numSlots` values in its first slots
+// (zeros elsewhere); the output has the values replicated with period numSlots over all slots.
+int Bootstrap(int id, int numSlots) {
+    API_BEGIN PROF("Bootstrap");
+    if (!S.bootSlots.count(numSlots)) throw std::runtime_error("no bootstrapper for this slot count");
+    CT x = cts.get(id)->Clone();
+    const double sIn = scale_of(x);
+    if (x->GetNoiseScaleDeg() != 1) throw std::runtime_error("bootstrap: ciphertext must be rescaled first");
+    int lvl = level_of(x);
+    if (lvl < 1) throw std::runtime_error("bootstrap: input needs at least two limbs");
+    if (lvl > 1) x = S.cc->LevelReduce(x, nullptr, lvl - 1);  // OpenFHE consumes one level before raising the modulus
+    for (int k = numSlots; k < static_cast<int>(S.slots); k *= 2) {  // fold the zero-padded vector into its periodic form
+        CT r = rotate(x, k);
+        x = S.cc->EvalAdd(x, r);
+    }
+    x->SetSlots(numSlots);
+    if (prof_on()) std::fprintf(stderr, "[BTP] input towers=%d deg=%zu slots=%u\n", level_of(x) + 1, x->GetNoiseScaleDeg(), x->GetSlots());
+    CT out = S.cc->EvalBootstrap(x);
+    out->SetSlots(S.slots);
+    if (prof_on()) std::fprintf(stderr, "[BTP] output towers=%d deg=%zu\n", level_of(out) + 1, out->GetNoiseScaleDeg());
+    while (out->GetNoiseScaleDeg() > 1) out = S.cc->ModReduce(out);
+    int ol = level_of(out);
+    if (ol > static_cast<int>(S.userDepth)) out = S.cc->LevelReduce(out, nullptr, ol - static_cast<int>(S.userDepth));
+    return push_ct(out, sIn);
+    API_END("Bootstrap")
+}
 void DeleteBootstrappers(void) {}
 
 }  // extern "C"
