@@ -1,0 +1,17 @@
+includes:
+  - base.yaml
+targets:
+  - target: /bin
+    createlinks:
+      - src: /opt/python-orion/bin/python3
+        linkname: python3
+  - target: /opt
+    copy:
+      - dirs:
+          - /opt/python-orion
+  # Orion code, Lattigo library, configs, data and model: all inside the protected FS
+  - target: /work
+    copy:
+      - from: /tmp/w/stage
+        dirs: [orion, examples, configs, data, model]
+        files: [launch.py]
