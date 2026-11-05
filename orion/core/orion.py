@@ -92,7 +92,12 @@ class Scheme:
             py_lattigo = lgo.LattigoLibrary()
             py_lattigo.setup_bindings(params)
             return py_lattigo
-        elif backend in ("heaan", "openfhe"):
+        elif backend == "openfhe":
+            from orion.backend.openfhe.bindings import OpenFHELibrary
+            py_openfhe = OpenFHELibrary()
+            py_openfhe.setup_bindings(params)
+            return py_openfhe
+        elif backend == "heaan":
             raise ValueError(f"Backend {backend} not yet supported.")
         else:
             raise ValueError(
