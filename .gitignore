@@ -11,6 +11,7 @@
 # C extensions
 *.so
 *.h
+!orion/backend/c_api/*.h
 
 # Distribution / packaging
 .Python
