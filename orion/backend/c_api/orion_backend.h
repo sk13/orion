@@ -135,6 +135,10 @@ void RemovePlaintextDiagonals(int transformId);
 void RemoveRotationKeys(void);
 
 /* ---- bootstrapping ----------------------------------------------------- */
+/* Backend-specific extension of the OpenFHE library (not exported by Lattigo): call before NewScheme
+ * to reserve bootstrapping levels above the user-visible modulus chain. */
+void OrionOpenFHEConfigureBootstrapping(int enable, int levelBudgetEnc, int levelBudgetDec);
+
 void NewBootstrapper(int* logPs, int lenLogPs, int numSlots);
 int Bootstrap(int ct, int numSlots);
 void DeleteBootstrappers(void);
