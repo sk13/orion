@@ -11,6 +11,7 @@
 //    real values in the real lane), which gives the same slot count and rotation semantics.
 //  * Rotation-key ids exposed to Python are plain rotation amounts.
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <complex>
 #include <cstdio>
@@ -25,6 +26,7 @@
 #include <vector>
 
 #include "openfhe.h"
+#include "scheme/ckksrns/ckksrns-fhe.h"
 #include "orion_backend.h"
 
 using namespace lbcrypto;
@@ -38,6 +40,20 @@ namespace {
     std::abort();
 }
 
+struct ProfEntry { double ms = 0; long calls = 0; };
+std::map<std::string, ProfEntry>& prof_table() { static std::map<std::string, ProfEntry> t; return t; }
+bool prof_on() { static const bool on = std::getenv("ORION_OPENFHE_PROFILE") != nullptr; return on; }
+struct ProfScope {
+    const char* name; std::chrono::steady_clock::time_point t0;
+    explicit ProfScope(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~ProfScope() {
+        if (!prof_on()) return;
+        auto& e = prof_table()[name];
+        e.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        e.calls++;
+    }
+};
+#define PROF(name) ProfScope _prof_scope(name)
 #define API_BEGIN try {
 #define API_END(name) } catch (const std::exception& e) { fatal(name, e.what()); } catch (...) { fatal(name, "unknown error"); }
 [[noreturn]] void unsupported(const char* fn) { fatal(fn, "not implemented in the OpenFHE backend yet"); }
@@ -76,9 +92,10 @@ struct LinTransform {
     int level = 0;
     int n1 = 1;
     std::vector<int> babyIdx;     // distinct baby-step rotations (excluding 0)
-    std::vector<int> giantIdx;    // distinct giant-step rotations j*n1 (excluding 0)
-    // (giant offset, baby offset) -> pre-rotated, encoded diagonal
-    std::map<std::pair<int, int>, Plaintext> diags;
+    std::vector<int> giants;      // ascending giant offsets G (multiples of n1)
+    std::set<int> rotKeys;        // every rotation amount the evaluation needs
+    // For each giant offset: (baby offset, plaintext in the extended basis Q_l*P)
+    std::vector<std::vector<std::pair<int, Plaintext>>> terms;
     double scale = 1.0;
 };
 
@@ -266,6 +283,11 @@ void NewScheme(int logN, int* logQ, int lenQ, int* logP, int lenP, int logScale,
 }
 
 void DeleteScheme(void) {
+    if (prof_on()) {
+        for (auto& kv : prof_table())
+            std::fprintf(stderr, "[PROF] %-26s %8.1f ms  %6ld calls\n", kv.first.c_str(), kv.second.ms, kv.second.calls);
+        prof_table().clear();
+    }
     pts.reset(); cts.reset(); lts.reset(); polys.reset();
     S.reset();
     CryptoContextFactory<DCRTPoly>::ReleaseAllContexts();
@@ -312,7 +334,7 @@ void LoadSecretKey(unsigned char*, unsigned long) { unsupported("LoadSecretKey")
 void NewEncoder(void) {}
 
 int Encode(float* values, int len, int level, unsigned long scale) {
-    API_BEGIN
+    API_BEGIN PROF("Encode");
     std::vector<std::complex<double>> v(len);
     for (int i = 0; i < len; i++) v[i] = values[i];
     PtEntry e;
@@ -363,7 +385,7 @@ void NewEncryptor(void) {}
 void NewDecryptor(void) {}
 
 int Encrypt(int id) {
-    API_BEGIN
+    API_BEGIN PROF("Encrypt");
     auto& e = pts.get(id);
     CT ct = S.cc->Encrypt(S.kp.publicKey, e.pt);
     return push_ct(ct, e.scale);
@@ -371,7 +393,7 @@ int Encrypt(int id) {
 }
 
 int Decrypt(int id) {
-    API_BEGIN
+    API_BEGIN PROF("Decrypt");
     CT ct = cts.get(id);
     if (ct->GetNoiseScaleDeg() != 1)
         throw std::runtime_error("decrypt: ciphertext must be rescaled first (noise scale degree " +
@@ -409,8 +431,8 @@ int Negate(int id) {
 static int do_rotate(int id, int amount, bool inPlace) {
     return unary(id, inPlace, [&](const CT& ct) { return Res{rotate(ct, amount), scale_of(ct)}; });
 }
-int Rotate(int id, int amount) { API_BEGIN return do_rotate(id, amount, true); API_END("Rotate") }
-int RotateNew(int id, int amount) { API_BEGIN return do_rotate(id, amount, false); API_END("RotateNew") }
+int Rotate(int id, int amount) { API_BEGIN PROF("Rotate"); return do_rotate(id, amount, true); API_END("Rotate") }
+int RotateNew(int id, int amount) { API_BEGIN PROF("RotateNew"); return do_rotate(id, amount, false); API_END("RotateNew") }
 
 static int do_rescale(int id, bool inPlace) {
     return unary(id, inPlace, [&](const CT& ct) {
@@ -420,8 +442,8 @@ static int do_rescale(int id, bool inPlace) {
         return Res{S.cc->ModReduce(ct), s};
     });
 }
-int Rescale(int id) { API_BEGIN return do_rescale(id, true); API_END("Rescale") }
-int RescaleNew(int id) { API_BEGIN return do_rescale(id, false); API_END("RescaleNew") }
+int Rescale(int id) { API_BEGIN PROF("Rescale"); return do_rescale(id, true); API_END("Rescale") }
+int RescaleNew(int id) { API_BEGIN PROF("RescaleNew"); return do_rescale(id, false); API_END("RescaleNew") }
 
 static int scalar_add(int id, double s, bool inPlace, bool sub) {
     return unary(id, inPlace, [&](const CT& ct) {
@@ -465,11 +487,11 @@ static int pt_op(int cid, int pid, bool inPlace, int kind) {  // 0 add, 1 sub, 2
         return Res{S.cc->EvalMult(ct, pt), scale_of(ct) * e.scale};
     });
 }
-int AddPlaintext(int c, int p) { API_BEGIN return pt_op(c, p, true, 0); API_END("AddPlaintext") }
-int AddPlaintextNew(int c, int p) { API_BEGIN return pt_op(c, p, false, 0); API_END("AddPlaintextNew") }
+int AddPlaintext(int c, int p) { API_BEGIN PROF("AddPlaintext"); return pt_op(c, p, true, 0); API_END("AddPlaintext") }
+int AddPlaintextNew(int c, int p) { API_BEGIN PROF("AddPlaintextNew"); return pt_op(c, p, false, 0); API_END("AddPlaintextNew") }
 int SubPlaintext(int c, int p) { API_BEGIN return pt_op(c, p, true, 1); API_END("SubPlaintext") }
 int SubPlaintextNew(int c, int p) { API_BEGIN return pt_op(c, p, false, 1); API_END("SubPlaintextNew") }
-int MulPlaintext(int c, int p) { API_BEGIN return pt_op(c, p, true, 2); API_END("MulPlaintext") }
+int MulPlaintext(int c, int p) { API_BEGIN PROF("MulPlaintext"); return pt_op(c, p, true, 2); API_END("MulPlaintext") }
 int MulPlaintextNew(int c, int p) { API_BEGIN return pt_op(c, p, false, 2); API_END("MulPlaintextNew") }
 
 static int ct_op(int a, int b, bool inPlace, int kind) {  // 0 add, 1 sub, 2 mul+relin
@@ -481,12 +503,12 @@ static int ct_op(int a, int b, bool inPlace, int kind) {  // 0 add, 1 sub, 2 mul
         return Res{S.cc->EvalMult(xa, ya), scale_of(x) * scale_of(ya)};
     });
 }
-int AddCiphertext(int a, int b) { API_BEGIN return ct_op(a, b, true, 0); API_END("AddCiphertext") }
+int AddCiphertext(int a, int b) { API_BEGIN PROF("AddCiphertext"); return ct_op(a, b, true, 0); API_END("AddCiphertext") }
 int AddCiphertextNew(int a, int b) { API_BEGIN return ct_op(a, b, false, 0); API_END("AddCiphertextNew") }
 int SubCiphertext(int a, int b) { API_BEGIN return ct_op(a, b, true, 1); API_END("SubCiphertext") }
 int SubCiphertextNew(int a, int b) { API_BEGIN return ct_op(a, b, false, 1); API_END("SubCiphertextNew") }
-int MulRelinCiphertext(int a, int b) { API_BEGIN return ct_op(a, b, true, 2); API_END("MulRelinCiphertext") }
-int MulRelinCiphertextNew(int a, int b) { API_BEGIN return ct_op(a, b, false, 2); API_END("MulRelinCiphertextNew") }
+int MulRelinCiphertext(int a, int b) { API_BEGIN PROF("MulRelinCiphertext"); return ct_op(a, b, true, 2); API_END("MulRelinCiphertext") }
+int MulRelinCiphertextNew(int a, int b) { API_BEGIN PROF("MulRelinCiphertextNew"); return ct_op(a, b, false, 2); API_END("MulRelinCiphertextNew") }
 
 // ------------------------------------------------------ polynomial evaluator --
 void NewPolynomialEvaluator(void) {}
@@ -508,12 +530,16 @@ ArrayResultDouble GenerateMinimaxSignCoeffs(int*, int, int, int, int, int) { uns
 // ---------------------------------------------------------- linear transforms --
 void NewLinearTransformEvaluator(void) {}
 
-// Baby-step/giant-step: diagonal d = j*n1 + i is applied as
-//   rot_{j*n1}( sum_i  rot_{-j*n1}(diag_d) * rot_i(ct) )
+// Baby-step/giant-step with double hoisting (as in OpenFHE's own bootstrapping linear
+// transforms): diagonal d = G + i is applied as rot_G( sum_i rot_{-G}(diag_d) * rot_i(ct) ).
+// Baby rotations share one digit decomposition and stay in the extended basis Q_l*P, the
+// giant steps are accumulated Horner-style in the extended basis, and a single mod-down
+// is done at the end.
 int GenerateLinearTransform(int* diagIdxs, int lenIdxs, float* diagData, int lenData, int level,
                             float bsgsRatio, char* ioMode) {
     API_BEGIN
     if (std::string(ioMode) != "none") unsupported("GenerateLinearTransform (io_mode save/load)");
+    (void)bsgsRatio;
     const int n = static_cast<int>(S.slots);
     if (lenData != lenIdxs * n) throw std::runtime_error("linear transform: unexpected diagonal data length");
     if (level < 1 || level > static_cast<int>(S.depth)) throw std::runtime_error("linear transform: invalid level");
@@ -521,13 +547,13 @@ int GenerateLinearTransform(int* diagIdxs, int lenIdxs, float* diagData, int len
     std::vector<int> idx(lenIdxs);
     for (int i = 0; i < lenIdxs; i++) idx[i] = normRot(diagIdxs[i]);
 
-    // Pick the baby-step size that minimises (#baby rotations) + ratio * (#giant rotations).
-    double ratio = std::max(1.0f, bsgsRatio);
+    // Choose the baby-step size: hoisted baby rotations cost about half of a giant step.
+    const double babyCost = 0.5, giantCost = 1.0;
     int bestN1 = 1; double bestCost = 1e300;
     for (int n1 = 1; n1 <= n; n1++) {
         std::set<int> b, g;
-        for (int d : idx) { if (d % n1) b.insert(d % n1); if (d / n1) g.insert((d / n1) * n1); }
-        double cost = b.size() + ratio * g.size();
+        for (int d : idx) { if (d % n1) b.insert(d % n1); g.insert((d / n1) * n1); }
+        double cost = babyCost * b.size() + giantCost * (g.size() - 1 + (*g.begin() > 0 ? 1 : 0));
         if (cost < bestCost) { bestCost = cost; bestN1 = n1; }
     }
 
@@ -535,49 +561,139 @@ int GenerateLinearTransform(int* diagIdxs, int lenIdxs, float* diagData, int len
     lt.level = level;
     lt.n1 = bestN1;
     lt.scale = static_cast<double>(S.Q[level]);
-    std::set<int> babies, giants;
-    for (int k = 0; k < lenIdxs; k++) {
-        int d = idx[k], j = d / bestN1, i = d % bestN1, g = j * bestN1;
-        if (i) babies.insert(i);
-        if (g) giants.insert(g);
-        // plaintext = diag rotated by -g so that the outer rotation by g realigns it
-        std::vector<std::complex<double>> v(n);
-        const float* diag = diagData + static_cast<size_t>(k) * n;
-        for (int t = 0; t < n; t++) v[t] = diag[((t - g) % n + n) % n];
-        lt.diags[{g, i}] = encode(v, true, level, lt.scale);
-    }
+
+    std::set<int> babies, giantSet;
+    for (int d : idx) { if (d % bestN1) babies.insert(d % bestN1); giantSet.insert((d / bestN1) * bestN1); }
     lt.babyIdx.assign(babies.begin(), babies.end());
-    lt.giantIdx.assign(giants.begin(), giants.end());
+    lt.giants.assign(giantSet.begin(), giantSet.end());
+    lt.terms.resize(lt.giants.size());
+    lt.rotKeys = babies;
+    for (size_t k = 0; k + 1 < lt.giants.size(); k++) lt.rotKeys.insert(lt.giants[k + 1] - lt.giants[k]);
+    if (lt.giants.front() > 0) lt.rotKeys.insert(lt.giants.front());
+
+    // Element parameters of the extended basis Q_l * P.
+    auto cp = std::dynamic_pointer_cast<CryptoParametersCKKSRNS>(S.cc->GetCryptoParameters());
+    auto elementParams = *(cp->GetElementParams());
+    for (uint32_t i = 0; i < S.depth - level; i++) elementParams.PopLastParam();
+    const auto& paramsQ = elementParams.GetParams();
+    const auto& paramsP = cp->GetParamsP()->GetParams();
+    std::vector<NativeInteger> moduli, roots;
+    for (auto& t : paramsQ) { moduli.push_back(t->GetModulus()); roots.push_back(t->GetRootOfUnity()); }
+    for (auto& t : paramsP) { moduli.push_back(t->GetModulus()); roots.push_back(t->GetRootOfUnity()); }
+    auto paramsQlP = std::make_shared<ILDCRTParams<DCRTPoly::Integer>>(S.cc->GetCyclotomicOrder(), moduli, roots);
+
+    struct Job { size_t g; int i; int k; };
+    std::vector<Job> jobs;
+    for (int k = 0; k < lenIdxs; k++) {
+        int d = idx[k], G = (d / bestN1) * bestN1;
+        size_t gi = std::lower_bound(lt.giants.begin(), lt.giants.end(), G) - lt.giants.begin();
+        jobs.push_back({gi, d % bestN1, k});
+        lt.terms[gi].push_back({d % bestN1, nullptr});
+    }
+    // fill plaintexts (each term slot matches its job in insertion order per giant)
+    std::vector<size_t> fill(lt.giants.size(), 0);
+    std::vector<std::pair<size_t, size_t>> where(jobs.size());
+    for (size_t j = 0; j < jobs.size(); j++) where[j] = {jobs[j].g, fill[jobs[j].g]++};
+
+    const double f = lt.scale / std::pow(2.0, S.scaleBits);
+    const uint32_t ofheLevel = S.depth - level;
+    const int njobs = static_cast<int>(jobs.size());
+    std::string err;
+#pragma omp parallel for num_threads(OpenFHEParallelControls.GetThreadLimit(njobs))
+    for (int j = 0; j < njobs; j++) {
+        try {
+            int G = lt.giants[jobs[j].g];
+            const float* diag = diagData + static_cast<size_t>(jobs[j].k) * n;
+            // plaintext = diag rotated by -G so that the giant rotation by G realigns it
+            std::vector<std::complex<double>> v(n);
+            for (int t = 0; t < n; t++) v[t] = static_cast<double>(diag[((t - G) % n + n) % n]) * f;
+            lt.terms[where[j].first][where[j].second].second =
+                    FHECKKSRNS::MakeAuxPlaintext(*S.cc, paramsQlP, v, 1, ofheLevel, n);
+        } catch (const std::exception& e) {
+#pragma omp critical
+            err = e.what();
+        }
+    }
+    if (!err.empty()) throw std::runtime_error(err);
     return lts.add(std::move(lt));
     API_END("GenerateLinearTransform")
 }
 
 int EvaluateLinearTransform(int tid, int cid) {
-    API_BEGIN
+    API_BEGIN PROF("EvaluateLinearTransform");
     auto& lt = lts.get(tid);
     const CT& ct = cts.get(cid);
     if (level_of(ct) != lt.level)
         throw std::runtime_error("linear transform: input level " + std::to_string(level_of(ct)) +
                                  " != transform level " + std::to_string(lt.level));
+    using clk = std::chrono::steady_clock;
+    static const bool prof = std::getenv("ORION_OPENFHE_PROFILE") != nullptr;
+    auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    auto t0 = clk::now();
 
-    std::map<int, CT> baby;
-    baby[0] = ct;
-    for (int i : lt.babyIdx) baby[i] = rotate(ct, i);
-
-    std::map<int, CT> acc;  // giant offset -> inner sum
-    for (auto& kv : lt.diags) {
-        int g = kv.first.first, i = kv.first.second;
-        CT term = S.cc->EvalMult(baby.at(i), kv.second);
-        auto it = acc.find(g);
-        if (it == acc.end()) acc[g] = term; else it->second = S.cc->EvalAdd(it->second, term);
+    // Hoisted baby steps in the extended basis (one digit decomposition for all of them).
+    for (int i : lt.babyIdx) ensure_rot_key(i);
+    for (int k : lt.rotKeys) ensure_rot_key(k);
+    std::vector<CT> fast(lt.n1);
+    fast[0] = S.cc->KeySwitchExt(ct, true);
+    if (!lt.babyIdx.empty()) {
+        auto digits = S.cc->EvalFastRotationPrecompute(ct);
+        const int nb = static_cast<int>(lt.babyIdx.size());
+#pragma omp parallel for num_threads(OpenFHEParallelControls.GetThreadLimit(nb))
+        for (int b = 0; b < nb; b++)
+            fast[lt.babyIdx[b]] = S.cc->EvalFastRotationExt(ct, lt.babyIdx[b], digits, true);
     }
+    auto t1 = clk::now();
 
-    CT out;
-    for (auto& kv : acc) {
-        CT t = kv.first ? rotate(kv.second, kv.first) : kv.second;
-        out = out ? S.cc->EvalAdd(out, t) : t;
+    // Inner sums per giant offset (extended basis).
+    const int ng = static_cast<int>(lt.giants.size());
+    std::vector<CT> inner(ng);
+#pragma omp parallel for num_threads(OpenFHEParallelControls.GetThreadLimit(ng))
+    for (int g = 0; g < ng; g++) {
+        auto& terms = lt.terms[g];
+        // acc = sum_t fast[b_t] * pt_t, without copying the plaintexts and reusing one scratch poly
+        auto firstEl = [&](const CT& a, const Plaintext& pt) {
+            CT r = a->Clone();
+            const DCRTPoly& pe = pt->GetElement<DCRTPoly>();
+            for (auto& c : r->GetElements()) c *= pe;
+            return r;
+        };
+        CT acc = firstEl(fast[terms[0].first], terms[0].second);
+        DCRTPoly tmp;
+        for (size_t t = 1; t < terms.size(); t++) {
+            const DCRTPoly& pe = terms[t].second->GetElement<DCRTPoly>();
+            const auto& src = fast[terms[t].first]->GetElements();
+            auto& dst = acc->GetElements();
+            for (size_t e = 0; e < dst.size(); e++) {
+                tmp = src[e];
+                tmp *= pe;
+                dst[e] += tmp;
+            }
+        }
+        acc->SetNoiseScaleDeg(fast[0]->GetNoiseScaleDeg() + 1);
+        inner[g] = std::move(acc);
     }
-    if (!out) throw std::runtime_error("linear transform has no diagonals");
+    auto t2 = clk::now();
+
+    // Horner accumulation of the giant steps: outer = rot(outer) + inner_g, descending.
+    auto giantRotate = [&](const CT& outer, int amount) {
+        uint32_t autoIndex = 0;
+        std::vector<uint32_t> map;
+        auto key = FHECKKSRNS::GetGiantStepRotation(ct, amount, autoIndex, map);
+        return FHECKKSRNS::EvalHornerGiantRotate(outer, autoIndex, map, key);
+    };
+    CT outer = inner[ng - 1];
+    for (int g = ng - 2; g >= 0; g--) {
+        outer = giantRotate(outer, lt.giants[g + 1] - lt.giants[g]);
+        FHECKKSRNS::EvalAddExtInPlace(outer, inner[g]);
+    }
+    if (lt.giants.front() > 0) outer = giantRotate(outer, lt.giants.front());
+    CT out = S.cc->KeySwitchDown(outer);
+    if (prof) {
+        auto t3 = clk::now();
+        std::fprintf(stderr, "[LT] n1=%d babies=%zu giants=%d | hoisted baby rot %.1f ms, mul+add %.1f ms, giant+down %.1f ms\n",
+                     lt.n1, lt.babyIdx.size(), ng, ms(t0, t1), ms(t1, t2), ms(t2, t3));
+    }
     return push_ct(out, scale_of(ct) * lt.scale);
     API_END("EvaluateLinearTransform")
 }
@@ -587,9 +703,7 @@ void DeleteLinearTransform(int id) { lts.del(id); }
 ArrayResultInt GetLinearTransformRotationKeys(int tid) {
     API_BEGIN
     auto& lt = lts.get(tid);
-    std::set<int> keys(lt.babyIdx.begin(), lt.babyIdx.end());
-    keys.insert(lt.giantIdx.begin(), lt.giantIdx.end());
-    return int_array(std::vector<int>(keys.begin(), keys.end()));
+    return int_array(std::vector<int>(lt.rotKeys.begin(), lt.rotKeys.end()));
     API_END("GetLinearTransformRotationKeys")
 }
 

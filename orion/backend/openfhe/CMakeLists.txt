@@ -9,10 +9,14 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # Point CMAKE_PREFIX_PATH (or OpenFHE_DIR) at an OpenFHE installation.
+# An OpenFHE built with the Intel HEXL extension needs the HEXL package as well.
+find_package(HEXL QUIET)
 find_package(OpenFHE REQUIRED)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenFHE_CXX_FLAGS}")
 
 add_library(orion_openfhe SHARED src/orion_openfhe.cpp)
+# OpenFHE's headers only enable their OpenMP code paths (and thread limits) with PARALLEL.
+target_compile_definitions(orion_openfhe PRIVATE PARALLEL)
 target_include_directories(orion_openfhe PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../c_api
   ${OPENMP_INCLUDES}
