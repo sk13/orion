@@ -305,7 +305,10 @@ DCRTPoly read_poly(Reader& r, const std::vector<std::shared_ptr<ElemParams>>& ca
     DCRTPoly poly(ps, fmt, true);
     for (uint32_t i = 0; i < towers; i++) {
         NativeVector v(n, ps->GetParams()[i]->GetModulus());
-        std::memcpy(&v[0], r.cur, static_cast<size_t>(n) * sizeof(uint64_t));
+        // The residues were written as raw 64-bit words (write_poly); a NativeInteger is one such word, so the whole
+        // tower is copied in one go. The cast to void* says that this is meant (GCC 16 -Wclass-memaccess).
+        static_assert(sizeof(NativeInteger) == sizeof(uint64_t), "NativeInteger must be a single 64-bit word");
+        std::memcpy(static_cast<void*>(&v[0]), r.cur, static_cast<size_t>(n) * sizeof(uint64_t));
         r.cur += static_cast<size_t>(n) * sizeof(uint64_t);
         poly.GetAllElements()[i].SetValues(std::move(v), fmt);
     }
