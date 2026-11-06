@@ -106,3 +106,43 @@ def test_sparse_bootstrap_matches_lattigo_semantics():
             assert torch.allclose(y[k:k + slots], x[:slots], atol=1e-3)
     finally:
         s.delete_scheme()
+
+
+_IO_SCRIPT = r'''
+import json, sys, torch, orion
+import orion.models as models
+cfg = json.loads(sys.argv[1])
+torch.manual_seed(0)
+scheme = orion.init_scheme(cfg)
+net = models.MLP()
+net.eval()
+inp = torch.rand(1, 1, 28, 28)
+out_clear = net(inp)
+orion.fit(net, inp)
+level = orion.compile(net)
+ct = orion.encrypt(orion.encode(inp, level))
+net.he()
+out = net(ct).decrypt().decode()
+print("MAXERR", (out - out_clear).abs().max().item())
+'''
+
+
+def test_io_modes_save_then_load(tmp_path):
+    """io_mode save writes the secret key, rotation keys and encoded diagonals to disk; a fresh process
+    in io_mode load picks them up and gives the same result as without any I/O."""
+    import json
+    import subprocess
+    import sys
+
+    def run(mode):
+        cfg = json.loads(json.dumps(CONFIG))
+        cfg["orion"].update(io_mode=mode, diags_path=str(tmp_path / "diags.h5"),
+                            keys_path=str(tmp_path / "keys.h5"))
+        p = subprocess.run([sys.executable, "-c", _IO_SCRIPT, json.dumps(cfg)], capture_output=True, text=True)
+        assert p.returncode == 0, p.stdout[-2000:] + p.stderr[-2000:]
+        return float([l for l in p.stdout.splitlines() if l.startswith("MAXERR")][-1].split()[1])
+
+    assert run("none") < 0.1
+    assert run("save") < 0.1
+    assert (tmp_path / "diags.h5").stat().st_size > 0 and (tmp_path / "keys.h5").stat().st_size > 0
+    assert run("load") < 0.1

@@ -97,6 +97,11 @@ struct LinTransform {
     // For each giant offset: (baby offset, plaintext in the extended basis Q_l*P)
     std::vector<std::vector<std::pair<int, Plaintext>>> terms;
     double scale = 1.0;
+    // I/O modes (save/load): where each diagonal lives in `terms`, the element parameters of Q_l*P and a
+    // plaintext carrying all metadata but no polynomial, used to rebuild a diagonal from its serialized form.
+    std::unordered_map<int, std::pair<size_t, size_t>> diagLoc;
+    std::shared_ptr<ILDCRTParams<DCRTPoly::Integer>> params;
+    Plaintext shell;
 };
 
 struct PolyEntry { std::vector<double> coeffs; bool chebyshev = false; };
@@ -115,6 +120,8 @@ struct Scheme {
     double pyDefaultScale = 0;  // Orion's default scale 2^LogScale, mapped to 2^p when they differ
     std::vector<uint64_t> Q, P;
     std::set<int> rotKeys;   // rotation amounts with generated keys
+    std::set<int> transientKeys;     // rotation keys loaded from disk, dropped again by RemoveRotationKeys
+    std::set<uint32_t> permAuto;     // automorphism indices that must never be dropped (bootstrapping keys)
     bool relinGenerated = false;
 
     void reset() {
@@ -124,7 +131,7 @@ struct Scheme {
         pyDefaultScale = 0;
         off = 0;
         bootSlots.clear();
-        Q.clear(); P.clear(); rotKeys.clear();
+        Q.clear(); P.clear(); rotKeys.clear(); transientKeys.clear(); permAuto.clear();
         relinGenerated = false;
     }
 } S;
@@ -239,12 +246,116 @@ ArrayResultUInt64 u64_array(const std::vector<uint64_t>& v) {
     return r;
 }
 
+// ---- raw (de)serialization of polynomials, used by the save/load I/O modes ----------------
+// A polynomial is stored as: u32 towers, u32 ring dimension, u8 format, u64 fingerprint of the
+// moduli, then the coefficients of every tower. The fingerprint catches data that was written
+// for a different parameter set (OpenFHE picks the primes deterministically from the parameters).
+using ElemParams = ILDCRTParams<DCRTPoly::Integer>;
+static_assert(sizeof(NativeInteger) == sizeof(uint64_t), "NativeInteger must be a plain 64-bit word");
+
+uint64_t params_fingerprint(const ElemParams& ps) {
+    uint64_t h = 1469598103934665603ULL;  // FNV-1a
+    auto mix = [&](uint64_t v) { for (int i = 0; i < 8; i++) { h ^= (v >> (8 * i)) & 0xff; h *= 1099511628211ULL; } };
+    mix(ps.GetCyclotomicOrder());
+    for (const auto& t : ps.GetParams()) mix(t->GetModulus().ConvertToInt());
+    return h;
+}
+
+void put_raw(std::string& out, const void* data, size_t n) { out.append(static_cast<const char*>(data), n); }
+template <typename T> void put(std::string& out, T v) { put_raw(out, &v, sizeof(T)); }
+
+struct Reader {
+    const unsigned char* cur;
+    const unsigned char* end;
+    void need(size_t n) const {
+        if (static_cast<size_t>(end - cur) < n) throw std::runtime_error("serialized data is truncated");
+    }
+    template <typename T> T get() { need(sizeof(T)); T v; std::memcpy(&v, cur, sizeof(T)); cur += sizeof(T); return v; }
+};
+
+void write_poly(std::string& out, const DCRTPoly& p) {
+    const auto& towers = p.GetAllElements();
+    if (towers.empty()) throw std::runtime_error("cannot serialize an empty polynomial");
+    const uint32_t n = static_cast<uint32_t>(towers[0].GetLength());
+    put<uint32_t>(out, static_cast<uint32_t>(towers.size()));
+    put<uint32_t>(out, n);
+    put<uint8_t>(out, static_cast<uint8_t>(p.GetFormat()));
+    put<uint64_t>(out, params_fingerprint(*p.GetParams()));
+    out.reserve(out.size() + towers.size() * n * sizeof(uint64_t));
+    for (const auto& t : towers) put_raw(out, &t.GetValues()[0], n * sizeof(uint64_t));
+}
+
+// Reads a polynomial written by write_poly; `candidates` are the element parameters it may live over.
+DCRTPoly read_poly(Reader& r, const std::vector<std::shared_ptr<ElemParams>>& candidates) {
+    const uint32_t towers = r.get<uint32_t>(), n = r.get<uint32_t>();
+    const auto fmt = static_cast<Format>(r.get<uint8_t>());
+    const uint64_t fp = r.get<uint64_t>();
+    std::shared_ptr<ElemParams> ps;
+    for (const auto& c : candidates)
+        if (c && towers == c->GetParams().size() && n == c->GetRingDimension() && fp == params_fingerprint(*c)) {
+            ps = c;
+            break;
+        }
+    if (!ps)
+        throw std::runtime_error("serialized data was written for a different parameter set (" +
+                                 std::to_string(towers) + " towers, ring dimension " + std::to_string(n) + ")");
+    r.need(static_cast<size_t>(towers) * n * sizeof(uint64_t));
+    DCRTPoly poly(ps, fmt, true);
+    for (uint32_t i = 0; i < towers; i++) {
+        NativeVector v(n, ps->GetParams()[i]->GetModulus());
+        std::memcpy(&v[0], r.cur, static_cast<size_t>(n) * sizeof(uint64_t));
+        r.cur += static_cast<size_t>(n) * sizeof(uint64_t);
+        poly.GetAllElements()[i].SetValues(std::move(v), fmt);
+    }
+    return poly;
+}
+
+ArrayResultByte byte_array(const std::string& s) {
+    ArrayResultByte r{nullptr, 0};
+    if (s.empty()) return r;
+    r.Data = static_cast<char*>(std::malloc(s.size()));
+    std::memcpy(r.Data, s.data(), s.size());
+    r.Length = s.size();
+    return r;
+}
+
+// Element parameters a key polynomial can live over: Q*P, the public-key basis or Q alone.
+std::vector<std::shared_ptr<ElemParams>> key_params() {
+    auto cp = std::dynamic_pointer_cast<CryptoParametersRNS>(S.cc->GetCryptoParameters());
+    return {cp->GetParamsQP(), cp->GetParamsPK(), cp->GetElementParams()};
+}
+
+// ---- rotation keys -------------------------------------------------------------------------
+using AutoKeyMap = std::map<uint32_t, EvalKey<DCRTPoly>>;
+
+uint32_t auto_index(int rot) { return S.cc->FindAutomorphismIndex(static_cast<uint32_t>(rot)); }
+
+// Automorphism keys of the current secret key (nullptr while there are none).
+AutoKeyMap* auto_keys() {
+    auto& all = CryptoContextImpl<DCRTPoly>::GetAllEvalAutomorphismKeys();
+    auto it = all.find(S.kp.secretKey->GetKeyTag());
+    return it == all.end() ? nullptr : it->second.get();
+}
+
+bool key_present(int rot) {
+    auto* m = auto_keys();
+    return m && m->count(auto_index(rot));
+}
+
 void ensure_rot_key(int rot) {
     rot = normRot(rot);
     if (rot == 0 || S.rotKeys.count(rot)) return;
     S.cc->EvalAtIndexKeyGen(S.kp.secretKey, {rot});
     S.rotKeys.insert(rot);
     if (prof_on() && S.rotKeys.size() % 50 == 0) std::fprintf(stderr, "[KEYS] %zu rotation keys\n", S.rotKeys.size());
+}
+
+LinTransform& lt_with_diag(int tid, int diagIdx, std::pair<size_t, size_t>& loc) {
+    auto& lt = lts.get(tid);
+    auto it = lt.diagLoc.find(normRot(diagIdx));
+    if (it == lt.diagLoc.end()) throw std::runtime_error("linear transform has no diagonal " + std::to_string(diagIdx));
+    loc = it->second;
+    return lt;
 }
 
 // Rotation by +r moves slot r+i to slot i (same convention as Lattigo).
@@ -522,8 +633,25 @@ void GenerateRelinearizationKey(void) {
     API_END("GenerateRelinearizationKey")
 }
 void GenerateEvaluationKeys(void) {}
-ArrayResultByte SerializeSecretKey(void) { unsupported("SerializeSecretKey"); }
-void LoadSecretKey(unsigned char*, unsigned long) { unsupported("LoadSecretKey"); }
+ArrayResultByte SerializeSecretKey(void) {
+    API_BEGIN
+    std::string buf;
+    write_poly(buf, S.kp.secretKey->GetPrivateElement());
+    return byte_array(buf);
+    API_END("SerializeSecretKey")
+}
+// Restores the secret key written by SerializeSecretKey. No public key is derived from it (OpenFHE
+// has no API for that): encryption then uses the secret key, which is equivalent for Orion.
+void LoadSecretKey(unsigned char* data, unsigned long len) {
+    API_BEGIN
+    Reader r{data, data + len};
+    DCRTPoly poly = read_poly(r, key_params());
+    auto sk = std::make_shared<PrivateKeyImpl<DCRTPoly>>(S.cc);
+    sk->SetPrivateElement(std::move(poly));
+    S.kp.secretKey = sk;
+    S.kp.publicKey = nullptr;
+    API_END("LoadSecretKey")
+}
 
 // ------------------------------------------------------------------ encoder --
 void NewEncoder(void) {}
@@ -582,7 +710,7 @@ void NewDecryptor(void) {}
 int Encrypt(int id) {
     API_BEGIN PROF("Encrypt");
     auto& e = pts.get(id);
-    CT ct = S.cc->Encrypt(S.kp.publicKey, e.pt);
+    CT ct = S.kp.publicKey ? S.cc->Encrypt(S.kp.publicKey, e.pt) : S.cc->Encrypt(S.kp.secretKey, e.pt);
     return push_ct(ct, e.scale);
     API_END("Encrypt")
 }
@@ -745,7 +873,9 @@ void NewLinearTransformEvaluator(void) {}
 int GenerateLinearTransform(int* diagIdxs, int lenIdxs, float* diagData, int lenData, int level,
                             float bsgsRatio, char* ioMode) {
     API_BEGIN
-    if (std::string(ioMode) != "none") unsupported("GenerateLinearTransform (io_mode save/load)");
+    const std::string mode(ioMode);
+    if (mode != "none" && mode != "save" && mode != "load")
+        throw std::runtime_error("linear transform: unknown io_mode '" + mode + "'");
     (void)bsgsRatio;
     level += S.off;  // Orion level -> internal level
     const int n = static_cast<int>(S.slots);
@@ -801,7 +931,18 @@ int GenerateLinearTransform(int* diagIdxs, int lenIdxs, float* diagData, int len
     // fill plaintexts (each term slot matches its job in insertion order per giant)
     std::vector<size_t> fill(lt.giants.size(), 0);
     std::vector<std::pair<size_t, size_t>> where(jobs.size());
-    for (size_t j = 0; j < jobs.size(); j++) where[j] = {jobs[j].g, fill[jobs[j].g]++};
+    for (size_t j = 0; j < jobs.size(); j++) {
+        where[j] = {jobs[j].g, fill[jobs[j].g]++};
+        lt.diagLoc[idx[jobs[j].k]] = where[j];
+    }
+    lt.params = paramsQlP;
+    if (mode != "none") {
+        // metadata-only plaintext to rebuild diagonals from their serialized polynomial later
+        lt.shell = FHECKKSRNS::MakeAuxPlaintext(*S.cc, paramsQlP, std::vector<std::complex<double>>(n, 0.0), 1,
+                                                S.depth - level, n);
+        lt.shell->GetElement<DCRTPoly>() = DCRTPoly();
+    }
+    if (mode == "load") return lts.add(std::move(lt));  // diagonals are loaded from disk before each evaluation
 
     const double f = lt.scale / std::pow(2.0, S.scaleBits);
     const uint32_t ofheLevel = S.depth - level;
@@ -833,6 +974,9 @@ int EvaluateLinearTransform(int tid, int cid) {
     if (level_of(cts.get(cid)) < lt.level)
         throw std::runtime_error("linear transform: input level " + std::to_string(level_of(cts.get(cid))) +
                                  " < transform level " + std::to_string(lt.level));
+    for (const auto& giant : lt.terms)
+        for (const auto& term : giant)
+            if (!term.second) throw std::runtime_error("linear transform: diagonals are not loaded (io_mode load/save)");
     const CT ct = align_level(cts.get(cid), lt.level);  // a higher-level input is dropped to the transform's level
     using clk = std::chrono::steady_clock;
     static const bool prof = std::getenv("ORION_OPENFHE_PROFILE") != nullptr;
@@ -920,12 +1064,98 @@ void GenerateLinearTransformRotationKey(int keyId) {
     ensure_rot_key(keyId);
     API_END("GenerateLinearTransformRotationKey")
 }
-ArrayResultByte GenerateAndSerializeRotationKey(int) { unsupported("GenerateAndSerializeRotationKey"); }
-void LoadRotationKey(unsigned char*, unsigned long, unsigned long) { unsupported("LoadRotationKey"); }
-ArrayResultByte SerializeDiagonal(int, int) { unsupported("SerializeDiagonal"); }
-void LoadPlaintextDiagonal(unsigned char*, unsigned long, int, unsigned long) { unsupported("LoadPlaintextDiagonal"); }
-void RemovePlaintextDiagonals(int) { unsupported("RemovePlaintextDiagonals"); }
-void RemoveRotationKeys(void) { unsupported("RemoveRotationKeys"); }
+// Generates the key, hands it to Python as bytes and forgets it again unless it was there before.
+ArrayResultByte GenerateAndSerializeRotationKey(int keyId) {
+    API_BEGIN
+    const int rot = normRot(keyId);
+    if (rot == 0) throw std::runtime_error("no rotation key for the identity rotation");
+    const uint32_t ai = auto_index(rot);
+    const bool had = key_present(rot);
+    if (!had) S.cc->EvalAtIndexKeyGen(S.kp.secretKey, {rot});
+    auto* m = auto_keys();
+    auto it = m ? m->find(ai) : AutoKeyMap::iterator();
+    if (!m || it == m->end()) throw std::runtime_error("rotation key was not generated");
+    const EvalKey<DCRTPoly>& key = it->second;
+    std::string buf;
+    const auto& A = key->GetAVector();
+    const auto& B = key->GetBVector();
+    put<uint32_t>(buf, static_cast<uint32_t>(A.size()));
+    for (const auto& a : A) write_poly(buf, a);
+    for (const auto& b : B) write_poly(buf, b);
+    if (!had) m->erase(ai);
+    return byte_array(buf);
+    API_END("GenerateAndSerializeRotationKey")
+}
+
+// Installs a serialized rotation key until RemoveRotationKeys is called.
+void LoadRotationKey(unsigned char* data, unsigned long len, unsigned long keyId) {
+    API_BEGIN
+    const int rot = normRot(static_cast<int>(keyId));
+    if (rot == 0 || key_present(rot)) return;  // already available (e.g. generated on demand)
+    Reader r{data, data + len};
+    const auto ps = key_params();
+    const uint32_t digits = r.get<uint32_t>();
+    std::vector<DCRTPoly> A, B;
+    for (uint32_t i = 0; i < digits; i++) A.push_back(read_poly(r, ps));
+    for (uint32_t i = 0; i < digits; i++) B.push_back(read_poly(r, ps));
+    auto key = std::make_shared<EvalKeyRelinImpl<DCRTPoly>>(S.cc);
+    key->SetAVector(std::move(A));
+    key->SetBVector(std::move(B));
+    key->SetKeyTag(S.kp.secretKey->GetKeyTag());
+    auto one = std::make_shared<AutoKeyMap>();
+    (*one)[auto_index(rot)] = key;
+    CryptoContextImpl<DCRTPoly>::InsertEvalAutomorphismKey(one, S.kp.secretKey->GetKeyTag());
+    S.rotKeys.insert(rot);
+    S.transientKeys.insert(rot);
+    API_END("LoadRotationKey")
+}
+
+// Drops every rotation key installed by LoadRotationKey (bootstrapping keys stay).
+void RemoveRotationKeys(void) {
+    API_BEGIN
+    auto* m = auto_keys();
+    for (int rot : S.transientKeys) {
+        const uint32_t ai = auto_index(rot);
+        if (S.permAuto.count(ai)) continue;
+        if (m) m->erase(ai);
+        S.rotKeys.erase(rot);
+    }
+    S.transientKeys.clear();
+    API_END("RemoveRotationKeys")
+}
+
+// Returns the encoded diagonal and frees it: it is reloaded right before the transform is evaluated.
+ArrayResultByte SerializeDiagonal(int tid, int diagIdx) {
+    API_BEGIN
+    std::pair<size_t, size_t> loc;
+    auto& lt = lt_with_diag(tid, diagIdx, loc);
+    Plaintext& pt = lt.terms[loc.first][loc.second].second;
+    if (!pt) throw std::runtime_error("diagonal " + std::to_string(diagIdx) + " is not in memory");
+    std::string buf;
+    write_poly(buf, pt->GetElement<DCRTPoly>());
+    pt = nullptr;
+    return byte_array(buf);
+    API_END("SerializeDiagonal")
+}
+
+void LoadPlaintextDiagonal(unsigned char* data, unsigned long len, int tid, unsigned long diagIdx) {
+    API_BEGIN
+    std::pair<size_t, size_t> loc;
+    auto& lt = lt_with_diag(tid, static_cast<int>(diagIdx), loc);
+    if (!lt.shell) throw std::runtime_error("linear transform was not created in an I/O mode");
+    Reader r{data, data + len};
+    auto pt = std::make_shared<CKKSPackedEncoding>(static_cast<const CKKSPackedEncoding&>(*lt.shell));
+    pt->GetElement<DCRTPoly>() = read_poly(r, {lt.params});
+    lt.terms[loc.first][loc.second].second = pt;
+    API_END("LoadPlaintextDiagonal")
+}
+
+void RemovePlaintextDiagonals(int tid) {
+    API_BEGIN
+    for (auto& giant : lts.get(tid).terms)
+        for (auto& term : giant) term.second = nullptr;
+    API_END("RemovePlaintextDiagonals")
+}
 
 // ------------------------------------------------------------- bootstrapping --
 // Backend-specific extension (not exported by the Lattigo library): must be called before
@@ -943,6 +1173,8 @@ void NewBootstrapper(int*, int, int numSlots) {
     // The first modulus is larger than the scale; OpenFHE's correction factor must cover the difference.
     S.cc->EvalBootstrapSetup(S.levelBudget, {0, 0}, numSlots);
     S.cc->EvalBootstrapKeyGen(S.kp.secretKey, numSlots);
+    if (auto* m = auto_keys())  // bootstrapping needs these for good: RemoveRotationKeys must not drop them
+        for (const auto& kv : *m) S.permAuto.insert(kv.first);
     S.bootSlots.insert(numSlots);
     API_END("NewBootstrapper")
 }
