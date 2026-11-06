@@ -145,4 +145,6 @@ def test_io_modes_save_then_load(tmp_path):
     assert run("none") < 0.1
     assert run("save") < 0.1
     assert (tmp_path / "diags.h5").stat().st_size > 0 and (tmp_path / "keys.h5").stat().st_size > 0
+    # Only raw float32 diagonals go to disk (26 MB here); the encoded plaintexts would take ~280 MB.
+    assert (tmp_path / "diags.h5").stat().st_size < 100e6
     assert run("load") < 0.1
