@@ -244,6 +244,7 @@ void ensure_rot_key(int rot) {
     if (rot == 0 || S.rotKeys.count(rot)) return;
     S.cc->EvalAtIndexKeyGen(S.kp.secretKey, {rot});
     S.rotKeys.insert(rot);
+    if (prof_on() && S.rotKeys.size() % 50 == 0) std::fprintf(stderr, "[KEYS] %zu rotation keys\n", S.rotKeys.size());
 }
 
 // Rotation by +r moves slot r+i to slot i (same convention as Lattigo).
@@ -430,11 +431,12 @@ void NewScheme(int logN, int* logQ, int lenQ, int* logP, int lenP, int logScale,
     p.SetMultiplicativeDepth(lenQ - 1 + off + bootDepth);
     // OpenFHE's bootstrapping is only accurate with a scale of about 2^52 or more and a 60-bit q0
     // (it fails outright at 2^40). When bootstrapping is enabled the backend therefore uses its own
-    // internal scale and maps Orion's default scale onto it.
+    // internal scale and maps Orion's default scale onto it. 2^59 gives ~17 bits of precision after
+    // a bootstrap, 2^53 only ~11 bits, which is too coarse for Orion's composite-sign ReLU.
     int scaleBits = logScale;
     if (g_boot.enabled) {
         const char* e = std::getenv("ORION_OPENFHE_BOOT_SCALE");
-        scaleBits = std::max(logScale, e ? std::atoi(e) : 53);
+        scaleBits = std::max(logScale, e ? std::atoi(e) : 59);
     }
     p.SetScalingModSize(scaleBits);
     // OpenFHE's fixed-scaling bootstrapping requires q0 within a few bits of the scale.

@@ -44,8 +44,9 @@ Lattigo library (a multi-precision Remez algorithm): the OpenFHE backend loads
   hidden limb at the bottom (OpenFHE consumes a level before raising the modulus).
   OpenFHE's fixed-scaling bootstrap is only accurate with a scale of about 2^52 or
   more and a 60-bit first prime (it fails outright at 2^40), so the backend then uses
-  an internal scale of 2^53 (`ORION_OPENFHE_BOOT_SCALE`) and maps Orion's default
-  scale 2^LogScale onto it. Orion's levels and the moduli chain it sees are unchanged.
+  an internal scale of 2^59 (`ORION_OPENFHE_BOOT_SCALE`; 2^53 gives only ~11 bits after a
+  bootstrap, 2^59 about 17) and maps Orion's default scale 2^LogScale onto it. Orion's
+  levels and the moduli chain it sees are unchanged.
 * OpenFHE has no conjugate-invariant ring. `RingType: ConjugateInvariant` with
   `LogN` is emulated with a standard ring of degree `2^(LogN+1)`, which gives the
   same number of slots (`2^LogN`) and the same rotation semantics.
