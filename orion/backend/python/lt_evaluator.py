@@ -17,6 +17,9 @@ class NewEvaluator:
         self.diags_path = self.params.get_diags_path()
         self.keys_path = self.params.get_keys_path()
 
+        # Backends that encode diagonals lazily (OpenFHE) need no encoded plaintexts on disk.
+        self.plaintexts_on_disk = getattr(self.backend, "plaintexts_on_disk", True)
+
         self.saved_rotation_keys = set()
         self.new_evaluator()
 
@@ -45,7 +48,11 @@ class NewEvaluator:
             # Now we can generate any new rotation keys needed for
             # this linear transform.
             self.generate_rotation_keys(lintransf_id)
-            if self.io_mode == "save":
+            if self.io_mode != "none" and not self.plaintexts_on_disk:
+                # The backend now owns a copy of the diagonals; drop ours.
+                for idx in diags_idxs:
+                    diags[idx] = []
+            elif self.io_mode == "save":
                 self.save_plaintext_diagonals(
                     layer_name, lintransf_id, row, col, diags_idxs
                 )
@@ -167,7 +174,8 @@ class NewEvaluator:
 
                 if self.io_mode != "none":
                     self.load_rotation_keys(t_id)
-                    self.load_plaintext_diagonals(layer_name, i, j, t_id)
+                    if self.plaintexts_on_disk:
+                        self.load_plaintext_diagonals(layer_name, i, j, t_id)
 
                 res = self.backend.EvaluateLinearTransform(t_id, in_ctensor.ids[j]) 
                 ct = CipherTensor(self.scheme, res, out_shape, fhe_out_shape)
@@ -177,7 +185,8 @@ class NewEvaluator:
                     
                 if self.io_mode != "none":
                     self.remove_rotation_keys()
-                    self.remove_plaintext_diagonals(t_id)
+                    if self.plaintexts_on_disk:
+                        self.remove_plaintext_diagonals(t_id)
             
             # We know the output of this accumulation will just be one ciphertext
             ct_out_rescaled = self.evaluator.rescale(ct_out.ids[0], in_place=False)

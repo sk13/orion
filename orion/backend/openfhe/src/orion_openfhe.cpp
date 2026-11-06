@@ -97,11 +97,13 @@ struct LinTransform {
     // For each giant offset: (baby offset, plaintext in the extended basis Q_l*P)
     std::vector<std::vector<std::pair<int, Plaintext>>> terms;
     double scale = 1.0;
-    // I/O modes (save/load): where each diagonal lives in `terms`, the element parameters of Q_l*P and a
-    // plaintext carrying all metadata but no polynomial, used to rebuild a diagonal from its serialized form.
-    std::unordered_map<int, std::pair<size_t, size_t>> diagLoc;
-    std::shared_ptr<ILDCRTParams<DCRTPoly::Integer>> params;
-    Plaintext shell;
+    // I/O modes (save/load): an encoded diagonal in Q_l*P costs ~50x more than its float32 values, so
+    // the transform keeps only the raw diagonals (`raw[g][t]` belongs to `terms[g][t]`) and encodes each
+    // one right before it is multiplied (EvaluateLinearTransform), freeing it again straight away.
+    bool lazy = false;
+    std::vector<std::vector<std::vector<float>>> raw;
+    std::unordered_map<int, std::pair<size_t, size_t>> diagLoc;  // diagonal index -> (giant, term)
+    std::shared_ptr<ILDCRTParams<DCRTPoly::Integer>> params;     // element parameters of Q_l*P
 };
 
 struct PolyEntry { std::vector<double> coeffs; bool chebyshev = false; };
@@ -356,6 +358,18 @@ LinTransform& lt_with_diag(int tid, int diagIdx, std::pair<size_t, size_t>& loc)
     if (it == lt.diagLoc.end()) throw std::runtime_error("linear transform has no diagonal " + std::to_string(diagIdx));
     loc = it->second;
     return lt;
+}
+
+constexpr uint32_t kDiagMagic = 0x3147444f;  // "ODG1": header of a serialized raw diagonal
+
+// Encodes one diagonal into the extended basis Q_l*P. The values are rotated by -G so that the giant-step
+// rotation by G realigns them, and scaled so that the product has the transform's scale.
+Plaintext encode_diag(const LinTransform& lt, int G, const float* diag) {
+    const int n = static_cast<int>(S.slots);
+    const double f = lt.scale / std::pow(2.0, S.scaleBits);
+    std::vector<std::complex<double>> v(n);
+    for (int t = 0; t < n; t++) v[t] = static_cast<double>(diag[((t - G) % n + n) % n]) * f;
+    return FHECKKSRNS::MakeAuxPlaintext(*S.cc, lt.params, v, 1, S.depth - lt.level, n);
 }
 
 // Rotation by +r moves slot r+i to slot i (same convention as Lattigo).
@@ -936,28 +950,25 @@ int GenerateLinearTransform(int* diagIdxs, int lenIdxs, float* diagData, int len
         lt.diagLoc[idx[jobs[j].k]] = where[j];
     }
     lt.params = paramsQlP;
-    if (mode != "none") {
-        // metadata-only plaintext to rebuild diagonals from their serialized polynomial later
-        lt.shell = FHECKKSRNS::MakeAuxPlaintext(*S.cc, paramsQlP, std::vector<std::complex<double>>(n, 0.0), 1,
-                                                S.depth - level, n);
-        lt.shell->GetElement<DCRTPoly>() = DCRTPoly();
-    }
-    if (mode == "load") return lts.add(std::move(lt));  // diagonals are loaded from disk before each evaluation
-
-    const double f = lt.scale / std::pow(2.0, S.scaleBits);
-    const uint32_t ofheLevel = S.depth - level;
     const int njobs = static_cast<int>(jobs.size());
+    if (mode != "none") {
+        // Keep the raw diagonals only; they are encoded when the transform is evaluated.
+        lt.lazy = true;
+        lt.raw.resize(lt.giants.size());
+        for (size_t g = 0; g < lt.giants.size(); g++) lt.raw[g].resize(lt.terms[g].size());
+        for (int j = 0; j < njobs; j++) {
+            const float* diag = diagData + static_cast<size_t>(jobs[j].k) * n;
+            lt.raw[where[j].first][where[j].second].assign(diag, diag + n);
+        }
+        return lts.add(std::move(lt));
+    }
+
     std::string err;
 #pragma omp parallel for num_threads(OpenFHEParallelControls.GetThreadLimit(njobs))
     for (int j = 0; j < njobs; j++) {
         try {
-            int G = lt.giants[jobs[j].g];
             const float* diag = diagData + static_cast<size_t>(jobs[j].k) * n;
-            // plaintext = diag rotated by -G so that the giant rotation by G realigns it
-            std::vector<std::complex<double>> v(n);
-            for (int t = 0; t < n; t++) v[t] = static_cast<double>(diag[((t - G) % n + n) % n]) * f;
-            lt.terms[where[j].first][where[j].second].second =
-                    FHECKKSRNS::MakeAuxPlaintext(*S.cc, paramsQlP, v, 1, ofheLevel, n);
+            lt.terms[where[j].first][where[j].second].second = encode_diag(lt, lt.giants[jobs[j].g], diag);
         } catch (const std::exception& e) {
 #pragma omp critical
             err = e.what();
@@ -974,9 +985,10 @@ int EvaluateLinearTransform(int tid, int cid) {
     if (level_of(cts.get(cid)) < lt.level)
         throw std::runtime_error("linear transform: input level " + std::to_string(level_of(cts.get(cid))) +
                                  " < transform level " + std::to_string(lt.level));
-    for (const auto& giant : lt.terms)
-        for (const auto& term : giant)
-            if (!term.second) throw std::runtime_error("linear transform: diagonals are not loaded (io_mode load/save)");
+    for (size_t g = 0; g < lt.terms.size(); g++)
+        for (size_t t = 0; t < lt.terms[g].size(); t++)
+            if (lt.lazy ? lt.raw[g][t].empty() : !lt.terms[g][t].second)
+                throw std::runtime_error("linear transform: a diagonal is not in memory (it was serialized and not reloaded)");
     const CT ct = align_level(cts.get(cid), lt.level);  // a higher-level input is dropped to the transform's level
     using clk = std::chrono::steady_clock;
     static const bool prof = std::getenv("ORION_OPENFHE_PROFILE") != nullptr;
@@ -1000,31 +1012,45 @@ int EvaluateLinearTransform(int tid, int cid) {
     // Inner sums per giant offset (extended basis).
     const int ng = static_cast<int>(lt.giants.size());
     std::vector<CT> inner(ng);
-#pragma omp parallel for num_threads(OpenFHEParallelControls.GetThreadLimit(ng))
+    std::string innerErr;
+    // Dynamic scheduling: with lazily encoded diagonals the giant steps differ a lot in cost.
+#pragma omp parallel for schedule(dynamic, 1) num_threads(OpenFHEParallelControls.GetThreadLimit(ng))
     for (int g = 0; g < ng; g++) {
-        auto& terms = lt.terms[g];
-        // acc = sum_t fast[b_t] * pt_t, without copying the plaintexts and reusing one scratch poly
-        auto firstEl = [&](const CT& a, const Plaintext& pt) {
-            CT r = a->Clone();
-            const DCRTPoly& pe = pt->GetElement<DCRTPoly>();
-            for (auto& c : r->GetElements()) c *= pe;
-            return r;
-        };
-        CT acc = firstEl(fast[terms[0].first], terms[0].second);
-        DCRTPoly tmp;
-        for (size_t t = 1; t < terms.size(); t++) {
-            const DCRTPoly& pe = terms[t].second->GetElement<DCRTPoly>();
-            const auto& src = fast[terms[t].first]->GetElements();
-            auto& dst = acc->GetElements();
-            for (size_t e = 0; e < dst.size(); e++) {
-                tmp = src[e];
-                tmp *= pe;
-                dst[e] += tmp;
+        try {
+            auto& terms = lt.terms[g];
+            // The plaintext polynomial of term t: stored, or encoded now from the raw diagonal and dropped
+            // again when `hold` is overwritten or goes out of scope.
+            Plaintext hold;
+            auto element = [&](size_t t) -> const DCRTPoly& {
+                if (!lt.lazy) return terms[t].second->GetElement<DCRTPoly>();
+                hold = encode_diag(lt, lt.giants[g], lt.raw[g][t].data());
+                return hold->GetElement<DCRTPoly>();
+            };
+            // acc = sum_t fast[b_t] * pt_t, without copying the plaintexts and reusing one scratch poly
+            CT acc = fast[terms[0].first]->Clone();
+            {
+                const DCRTPoly& pe = element(0);
+                for (auto& c : acc->GetElements()) c *= pe;
             }
+            DCRTPoly tmp;
+            for (size_t t = 1; t < terms.size(); t++) {
+                const DCRTPoly& pe = element(t);
+                const auto& src = fast[terms[t].first]->GetElements();
+                auto& dst = acc->GetElements();
+                for (size_t e = 0; e < dst.size(); e++) {
+                    tmp = src[e];
+                    tmp *= pe;
+                    dst[e] += tmp;
+                }
+            }
+            acc->SetNoiseScaleDeg(fast[0]->GetNoiseScaleDeg() + 1);
+            inner[g] = std::move(acc);
+        } catch (const std::exception& e) {
+#pragma omp critical
+            innerErr = e.what();
         }
-        acc->SetNoiseScaleDeg(fast[0]->GetNoiseScaleDeg() + 1);
-        inner[g] = std::move(acc);
     }
+    if (!innerErr.empty()) throw std::runtime_error(innerErr);
     auto t2 = clk::now();
 
     // Horner accumulation of the giant steps: outer = rot(outer) + inner_g, descending.
@@ -1124,16 +1150,21 @@ void RemoveRotationKeys(void) {
     API_END("RemoveRotationKeys")
 }
 
-// Returns the encoded diagonal and frees it: it is reloaded right before the transform is evaluated.
+// A diagonal is serialized as its raw float32 values (u32 magic, u32 slots, then the floats), not as the
+// encoded plaintext, which would be ~50x larger. Serializing frees the shim's copy; it has to be loaded
+// again before the transform is evaluated.
 ArrayResultByte SerializeDiagonal(int tid, int diagIdx) {
     API_BEGIN
     std::pair<size_t, size_t> loc;
     auto& lt = lt_with_diag(tid, diagIdx, loc);
-    Plaintext& pt = lt.terms[loc.first][loc.second].second;
-    if (!pt) throw std::runtime_error("diagonal " + std::to_string(diagIdx) + " is not in memory");
+    auto& raw = lt.raw.at(loc.first).at(loc.second);
+    if (!lt.lazy || raw.empty()) throw std::runtime_error("diagonal " + std::to_string(diagIdx) + " is not in memory");
     std::string buf;
-    write_poly(buf, pt->GetElement<DCRTPoly>());
-    pt = nullptr;
+    buf.reserve(2 * sizeof(uint32_t) + raw.size() * sizeof(float));
+    put<uint32_t>(buf, kDiagMagic);
+    put<uint32_t>(buf, static_cast<uint32_t>(raw.size()));
+    put_raw(buf, raw.data(), raw.size() * sizeof(float));
+    std::vector<float>().swap(raw);
     return byte_array(buf);
     API_END("SerializeDiagonal")
 }
@@ -1142,18 +1173,25 @@ void LoadPlaintextDiagonal(unsigned char* data, unsigned long len, int tid, unsi
     API_BEGIN
     std::pair<size_t, size_t> loc;
     auto& lt = lt_with_diag(tid, static_cast<int>(diagIdx), loc);
-    if (!lt.shell) throw std::runtime_error("linear transform was not created in an I/O mode");
+    if (!lt.lazy) throw std::runtime_error("linear transform was not created in an I/O mode");
     Reader r{data, data + len};
-    auto pt = std::make_shared<CKKSPackedEncoding>(static_cast<const CKKSPackedEncoding&>(*lt.shell));
-    pt->GetElement<DCRTPoly>() = read_poly(r, {lt.params});
-    lt.terms[loc.first][loc.second].second = pt;
+    if (r.get<uint32_t>() != kDiagMagic) throw std::runtime_error("serialized diagonal has an unknown format");
+    const uint32_t n = r.get<uint32_t>();
+    if (n != S.slots) throw std::runtime_error("serialized diagonal was written for a different number of slots");
+    r.need(static_cast<size_t>(n) * sizeof(float));
+    auto& raw = lt.raw.at(loc.first).at(loc.second);
+    raw.resize(n);
+    std::memcpy(raw.data(), r.cur, static_cast<size_t>(n) * sizeof(float));
     API_END("LoadPlaintextDiagonal")
 }
 
+// Drops all diagonals of the transform from memory (they have to be loaded again for the next evaluation).
 void RemovePlaintextDiagonals(int tid) {
     API_BEGIN
-    for (auto& giant : lts.get(tid).terms)
-        for (auto& term : giant) term.second = nullptr;
+    auto& lt = lts.get(tid);
+    if (lt.lazy)
+        for (auto& giant : lt.raw)
+            for (auto& d : giant) std::vector<float>().swap(d);
     API_END("RemovePlaintextDiagonals")
 }
 

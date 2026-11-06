@@ -21,6 +21,11 @@ class OpenFHELibrary(LattigoLibrary):
     """
     LIB_NAME = "openfhe-linux.so"
 
+    # In the save/load I/O modes the shim keeps the raw float32 diagonals (the ones `save_transforms`
+    # writes and `load_transforms` reads) and encodes them while evaluating, so the evaluator has no
+    # per-plaintext files to write or read. (Encoded diagonals are ~50x larger than raw ones.)
+    plaintexts_on_disk = False
+
     def _load_library(self):
         path = os.environ.get("ORION_OPENFHE_LIB") or os.path.join(
             os.path.dirname(os.path.abspath(__file__)), self.LIB_NAME)
