@@ -1,4 +1,5 @@
 import os 
+import sys
 import ctypes
 import platform
 
@@ -103,18 +104,21 @@ class LattigoLibrary:
 
     def _load_library(self):
         try:
-            # Determine library name based on platform
-            if platform.system() == "Linux":
+            # Determine library name based on platform. sys.platform is fixed when the
+            # interpreter is built, whereas platform.system() asks the kernel (uname), which
+            # does not say "Linux" everywhere Linux binaries run (the Occlum SGX LibOS
+            # reports "Occlum").
+            if sys.platform.startswith("linux"):
                 lib_name = "lattigo-linux.so"
-            elif platform.system() == "Darwin":  # macOS
+            elif sys.platform == "darwin":  # macOS
                 if platform.machine().lower() in ("arm64", "aarch64"):
                     lib_name = "lattigo-mac-arm64.dylib"
                 else:
                     lib_name = "lattigo-mac.dylib"
-            elif platform.system() == "Windows":
+            elif sys.platform in ("win32", "cygwin"):
                 lib_name = "lattigo-windows.dll"
             else:
-                raise RuntimeError("Unsupported platform")
+                raise RuntimeError(f"Unsupported platform: {sys.platform}")
                         
             # Standard path
             current_dir = os.path.dirname(os.path.abspath(__file__))

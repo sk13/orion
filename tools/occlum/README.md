@@ -16,5 +16,5 @@ docker run --rm --entrypoint bash -e REBUILD=1 \
 Arguments: `<script relative to repo> <working dir inside enclave>`
 (`run_lola.py` and `run_helrm.py` expect `/work`, `run_mlp.py` and `run_resnet.py` expect `/work/examples`).
 Needs `data/` (MNIST/CIFAR) in the repo dir. `USS` sets the enclave user space (default 40GB;
-HELRM needs more than 12GB). `launch.py` overrides `platform.system()` because Occlum's
-`uname` does not report "Linux".
+HELRM needs more than 12GB).
+(Occlum's `uname` reports "Occlum", not "Linux"; the Lattigo loader goes by `sys.platform`, so this does not matter.)

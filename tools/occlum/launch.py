@@ -1,5 +1,4 @@
-import os, sys, runpy, platform
-platform.system = lambda: "Linux"   # Occlum's uname reports a different sysname
+import os, sys, runpy
 script, cwd = sys.argv[1], sys.argv[2]
 sys.path.insert(0, "/work"); os.chdir(cwd)
 sys.argv = [script]
